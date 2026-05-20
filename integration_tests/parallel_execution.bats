@@ -8,7 +8,7 @@ launch_mpi() {
 # THAPI_SYNC_DAEMON=fs Tests
 
 @test "sync_daemon_fs" {
-  THAPI_SYNC_DAEMON=fs launch_mpi -n 2 ./integration_tests/light_iprof_only_sync.sh clinfo
+  THAPI_SYNC_DAEMON=fs launch_mpi -n 2 ./integration_tests/light_iprof_only_sync.rb clinfo
 }
 
 @test "iprof_fs" {
@@ -27,7 +27,7 @@ launch_mpi() {
 
 # bats test_tags=mpi_sync_daemon
 @test "sync_daemon_mpi" {
-  THAPI_SYNC_DAEMON=mpi launch_mpi -n 2 ./integration_tests/light_iprof_only_sync.sh clinfo
+  THAPI_SYNC_DAEMON=mpi launch_mpi -n 2 ./integration_tests/light_iprof_only_sync.rb clinfo
 }
 
 # bats test_tags=mpi_sync_daemon
@@ -43,6 +43,11 @@ launch_mpi() {
   mpicc ./integration_tests/mpi_helloworld.c -o mpi_helloworld
   # Current bug in the CI where `mpi_finalize_session` hang
   THAPI_SYNC_DAEMON_MPI_NO_FINALIZE=1 THAPI_SYNC_DAEMON=mpi launch_mpi -n 2 iprof ./mpi_helloworld
+}
+
+# Non-MPI runs should ignore THAPI_SYNC_DAEMON entirely (no validation, no spawn).
+@test "sync_daemon_ignored_without_mpi" {
+  THAPI_SYNC_DAEMON=whatever-not-in-list iprof -- true
 }
 
 # Test Traced Rank

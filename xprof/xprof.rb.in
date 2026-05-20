@@ -34,6 +34,7 @@ require 'optparse_thapi'
 require 'pty'
 require 'digest/md5'
 require 'socket'
+require 'io/nonblock'
 require 'logger'
 require 'set'
 require 'securerandom'
@@ -347,36 +348,65 @@ end
 #   | \  _.  _  ._ _   _  ._
 #   |_/ (_| (/_ | | | (_) | |
 #
+# Shared socketpair protocol between iprof and its (sync/sampling) daemons.
+# Subclasses define `active?` (gating predicate) and call `spawn` from their initialize.
+module DaemonClient
+  MSG_INIT   = 'INIT'
+  MSG_FINISH = 'FINISH'
+  MSG_READY  = 'READY'
 
-class SpawnDaemon
-  SIGRTMIN = 34
-  RT_SIGNAL_READY = SIGRTMIN
-  RT_SIGNAL_FINISH = SIGRTMIN + 3
-
-  # This belongs to the global ruby process!
-  # This Object is NOT thread-safe, please do not spawn user thread
-  @@ready = false
-  Signal.trap(RT_SIGNAL_READY) { @@ready = true }
-
-  # Any blocking implementation
-  # (`IO.pipe`, `throw/catch`+sleep` deadlock for an unknown reason)
-  # This is why we spin-lock
-  def _lazy_exec(_cond, &block)
-    block.call
-    busy_wait_until { @@ready }
-    @@ready = false
-  end
-
-  def lazy_exec(message = nil, cond, &block)
+  # block triggers the daemon; lazy_exec blocks on its READY reply.
+  def lazy_exec(message = nil)
     LOGGER.with_info_block(message) do
-      unless cond
+      unless active?
         LOGGER.debug("#{message}: No-op")
         return
       end
-      # Don't inline, Trap doesn't work with logger
-      # https://bugs.ruby-lang.org/issues/7917
-      _lazy_exec(cond, &block)
+      yield
+      wait_ready
     end
+  end
+
+  def finalize
+    LOGGER.debug { "Finalize #{self.class}" }
+    return unless active?
+
+    @parent.sendmsg(MSG_FINISH)
+    wait_ready
+    _, status = Process.wait2(@pid)
+    @parent.close
+    LOGGER.warn("#{self.class} exited #{status}") unless status.success?
+  end
+
+  # Instance delegate so DaemonClient#lazy_exec / #finalize can call `active?`
+  # on the instance. Subclasses define the class-level `self.active?`.
+  def active?
+    self.class.active?
+  end
+
+  # Mirrors `Process.spawn(*cmd)` but adds:
+  #   - `log:` for the lazy_exec message
+  #   - implicit socketpair: the daemon's end is inserted as the first program
+  #     argument (after optional env hash) and kept open across exec via `fd => fd`.
+  def spawn(*cmd, log:)
+    lazy_exec(log) do
+      @parent, child = UNIXSocket.pair(:SEQPACKET)
+      # Ruby sets O_NONBLOCK on sockets by default; the daemon uses
+      # blocking read, so clear it on the inherited fd.
+      child.nonblock = false
+      fd = child.fileno
+      insert_at = cmd.first.is_a?(Hash) ? 2 : 1
+      @pid = Process.spawn(*cmd.dup.insert(insert_at, fd.to_s), fd => fd)
+      child.close
+      @parent.sendmsg(MSG_INIT)
+    end
+  end
+
+  private
+
+  def wait_ready
+    reply, = @parent.recvmsg(64)
+    raise "#{self.class}: expected #{MSG_READY}, got '#{reply}'" unless reply == MSG_READY
   end
 end
 
@@ -384,60 +414,51 @@ end
 #   |_)  _. ._ ._ o  _  ._
 #   |_) (_| |  |  | (/_ |
 #
-class SyncDaemon < SpawnDaemon
-  RT_SIGNAL_GLOBAL_BARRIER = SIGRTMIN + 1
-  RT_SIGNAL_LOCAL_BARRIER = SIGRTMIN + 2
+class SyncDaemon
+  include DaemonClient
 
-  def lazy_exec_mpi(message = nil, &block)
-    lazy_exec(message, MPITopo.active?, &block)
+  MSG_LOCAL_BARRIER  = 'LOCAL_BARRIER'
+  MSG_GLOBAL_BARRIER = 'GLOBAL_BARRIER'
+
+  SYNC_DAEMON_MPI_PATH = "#{BINDIR}/sync_daemon_mpi"
+  SYNC_DAEMON_FS_PATH = "#{BINDIR}/sync_daemon_fs"
+
+  def self.active?
+    MPITopo.active?
   end
 
   def initialize
-    super
-    daemon_type = env_fetch_first('THAPI_SYNC_DAEMON')
-    daemon = case daemon_type
-             when nil
-               # Default is MPI
-               if File.exist?("#{BINDIR}/sync_daemon_mpi")
-                 "#{BINDIR}/sync_daemon_mpi"
-               else
-                 LOGGER.warn("No #{BINDIR}/sync_daemon_mpi binary. Fallback to #{BINDIR}/sync_daemon_f")
-                 "#{BINDIR}/sync_daemon_fs"
-               end
-             when 'mpi'
-               raise("No #{BINDIR}/sync_daemon_mpi binary") unless File.exist?("#{BINDIR}/sync_daemon_mpi")
+    return unless active?
 
-               "#{BINDIR}/sync_daemon_mpi"
-             when 'fs'
-               "#{BINDIR}/sync_daemon_fs"
-             else
-               raise("Error: THAPI_SYNC_DAEMON value (#{daemon_type}) is not supported. Allowed: [mpi,fs] ")
-             end
+    daemon_path = case (daemon_type = env_fetch_first('THAPI_SYNC_DAEMON'))
+                  when 'mpi'
+                    unless File.exist?(SYNC_DAEMON_MPI_PATH)
+                      raise "No #{SYNC_DAEMON_MPI_PATH} binary. Did you compile with `--disable-sync-daemon-mpi`?"
+                    end
 
-    LOGGER.debug { "spawn(#{daemon} #{Process.pid})" }
-    lazy_exec_mpi("Initialize SyncDaemon #{daemon_type}") do
-      @pid = spawn("#{daemon} #{Process.pid}")
-    end
-  end
+                    SYNC_DAEMON_MPI_PATH
+                  when 'fs'
+                    SYNC_DAEMON_FS_PATH
+                  when nil
+                    if File.exist?(SYNC_DAEMON_MPI_PATH)
+                      SYNC_DAEMON_MPI_PATH
+                    else
+                      LOGGER.warn("No #{SYNC_DAEMON_MPI_PATH} binary. Fallback to #{SYNC_DAEMON_FS_PATH}")
+                      SYNC_DAEMON_FS_PATH
+                    end
+                  else
+                    raise "Error: THAPI_SYNC_DAEMON=#{daemon_type} is not supported. Allowed: [mpi,fs]"
+                  end
 
-  def finalize
-    LOGGER.debug { 'Finalize SyncDaemon' }
-    return unless MPITopo.active?
-
-    Process.kill(RT_SIGNAL_FINISH, @pid)
-    Process.wait(@pid)
+    spawn(daemon_path, log: "Initialize SyncDaemon #{daemon_type}")
   end
 
   def local_barrier(name)
-    lazy_exec_mpi("Local_barrier #{name}") do
-      Process.kill(RT_SIGNAL_LOCAL_BARRIER, @pid)
-    end
+    lazy_exec("Local_barrier #{name}") { @parent.sendmsg(MSG_LOCAL_BARRIER) }
   end
 
   def global_barrier
-    lazy_exec_mpi('Global_barrier') do
-      Process.kill(RT_SIGNAL_GLOBAL_BARRIER, @pid)
-    end
+    lazy_exec('Global_barrier') { @parent.sendmsg(MSG_GLOBAL_BARRIER) }
   end
 
   # The context manager ensure that when the block yield is exited
@@ -460,33 +481,21 @@ end
 #   __) (_| | | | |_) | | | | (_|
 #                 |            _|
 
-def sampling?
-  OPTIONS[:sample] && MPITopo.local_master?
-end
+class SamplingDaemon
+  include DaemonClient
 
-class SamplingDaemon < SpawnDaemon
-  def lazy_exec_sampling(message = nil, &block)
-    lazy_exec(message, sampling?, &block)
+  SAMPLING_DAEMON_PATH = "#{BINDIR}/thapi_sampling_daemon"
+
+  def self.active?
+    OPTIONS[:sample] && MPITopo.local_master?
   end
 
   def initialize(h = {})
-    super()
-    daemon_path = "#{BINDIR}/thapi_sampling_daemon"
-    raise "No sampling_daemon binary found at #{daemon_path}" unless File.exist?(daemon_path)
+    return unless active?
+    raise "No sampling_daemon binary found at #{SAMPLING_DAEMON_PATH}" unless File.exist?(SAMPLING_DAEMON_PATH)
 
-    path_so = h.fetch('THAPI_SAMPLING_LIBRARIES', '').gsub(':', ' ')
-    LOGGER.debug { "spawn(sampling_daemon) #{Process.pid} #{path_so}" }
-    lazy_exec_sampling('Initialize SamplingDaemon') do
-      @pid = spawn(h, "#{daemon_path} #{Process.pid} #{path_so}")
-    end
-  end
-
-  def finalize
-    LOGGER.debug { 'Finalize SamplingDaemon' }
-    return unless sampling?
-
-    Process.kill(RT_SIGNAL_FINISH, @pid)
-    Process.wait(@pid)
+    path_so = h.fetch('THAPI_SAMPLING_LIBRARIES', '').split(':')
+    spawn(h, SAMPLING_DAEMON_PATH, *path_so, log: 'Initialize SamplingDaemon')
   end
 end
 
@@ -656,18 +665,20 @@ module LocalMaster
     raise unless MPITopo.local_master?
 
     lttng_setup(backends)
-
-    sampling_daemon = SamplingDaemon.new(env) if sampling?
-    pids = bt_analysis(backends) if OPTIONS[:archive]
-
-    [sampling_daemon, pids]
+    sampling_daemon = SamplingDaemon.new(env)
+    begin
+      archive_pids = bt_analysis(backends) if OPTIONS[:archive]
+    rescue StandardError
+      sampling_daemon.finalize
+      raise
+    end
+    [sampling_daemon, archive_pids]
   end
 
-  def teardown_daemon(sampling_daemon, archive_pids)
+  def teardown(sampling_daemon, archive_pids)
     raise unless MPITopo.local_master?
 
-    sampling_daemon.finalize if sampling?
-
+    sampling_daemon.finalize
     lttng_teardown_session
     bt_wait_for_archive_processes(archive_pids) if OPTIONS[:archive]
 
@@ -738,7 +749,7 @@ module LocalMaster
            profiling: OPTIONS[:profile])
     end
 
-    if sampling?
+    if SamplingDaemon.active?
       channel_name = 'non-blocking-channel'
       exec("lttng enable-channel --userspace --session=#{lttng_session_uuid} #{channel_name}")
       exec("lttng add-context    --userspace --session=#{lttng_session_uuid} --channel=#{channel_name} -t vpid -t vtid")
@@ -912,7 +923,7 @@ def all_env_tracers(usr_binary)
   # Customization
   if OPTIONS[:'backend-names'].include?('ze')
     h['LTTNG_UST_ZE_PARANOID_DRIFT'] = 1 if OPTIONS[:profile]
-    if sampling?
+    if SamplingDaemon.active?
       # The current only reliable way to use zes api
       #   is to call zesInit and set ZES_ENABLE_SYSMAN to 0
       h['ZES_ENABLE_SYSMAN'] = 0
@@ -928,7 +939,7 @@ def all_env_tracers(usr_binary)
 
   if OPTIONS[:'backend-names'].include?('cxi')
     backends << 'cxi'
-    if sampling?
+    if SamplingDaemon.active?
       h['LTTNG_UST_CXI_SAMPLING_CXI'] = 1
       h['THAPI_SAMPLING_LIBRARIES'] << File.join(PKGLIBDIR, 'cxi', 'libCXISampling.so')
     end
@@ -940,7 +951,7 @@ def all_env_tracers(usr_binary)
   end
 
   # Sample
-  if sampling?
+  if SamplingDaemon.active?
     LOGGER.debug('Sampling Enabled')
     h['LTTNG_UST_SAMPLING'] = 1
     h[%w[LD_LIBRARY_PATH prepend]] << File.join(PKGLIBDIR, 'sampling')
@@ -973,7 +984,7 @@ def all_trace_and_processing(usr_argv)
       launch_usr_bin(env, usr_argv)
     ensure
       syncd.local_barrier('waiting_for_application_ending')
-      LocalMaster.teardown_daemon(sampling_daemon, archive_pids) if MPITopo.local_master?
+      LocalMaster.teardown(sampling_daemon, archive_pids) if MPITopo.local_master?
     end
 
     LocalMaster.bt_analysis(backends) if MPITopo.local_master? && !OPTIONS[:archive]
