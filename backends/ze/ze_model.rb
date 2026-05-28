@@ -137,28 +137,10 @@ ze_pointer_names += $zex_commands.collect do |c|
 end
 ZE_POINTER_NAMES = ze_pointer_names.to_h
 
-register_epilogue 'zeDeviceGet', <<EOF
-  if (_do_state()) {
-    if (_retval == ZE_RESULT_SUCCESS && phDevices && pCount) {
-      for (uint32_t i = 0; i < *pCount; i++)
-        _register_ze_device(phDevices[i], hDriver, NULL);
-    }
-  }
-EOF
-
-register_epilogue 'zeDeviceGetSubDevices', <<EOF
-  if (_do_state()) {
-    if (_retval == ZE_RESULT_SUCCESS && phSubdevices && pCount) {
-      for (uint32_t i = 0; i < *pCount; i++)
-        _register_ze_device(phSubdevices[i], NULL, hDevice);
-    }
-  }
-EOF
-
 register_epilogue 'zeCommandListCreate', <<EOF
   if (_do_state()) {
     if (_retval == ZE_RESULT_SUCCESS && phCommandList && *phCommandList) {
-      _on_create_command_list(*phCommandList, hContext, hDevice, 0);
+      _on_create_command_list(*phCommandList, 0);
     }
   }
 EOF
@@ -166,7 +148,7 @@ EOF
 register_epilogue 'zeCommandListCreateImmediate', <<EOF
   if (_do_state()) {
     if (_retval == ZE_RESULT_SUCCESS && phCommandList && *phCommandList) {
-      _on_create_command_list(*phCommandList, hContext, hDevice, 1);
+      _on_create_command_list(*phCommandList, 1);
     }
   }
 EOF
@@ -209,12 +191,6 @@ register_prologue 'zeEventCreate', <<EOF
     _new_desc.signal |= ZE_EVENT_SCOPE_FLAG_HOST;
     _new_desc.wait |= ZE_EVENT_SCOPE_FLAG_HOST;
     desc = &_new_desc;
-  }
-EOF
-
-register_epilogue 'zeEventCreate', <<EOF
-  if (_do_profile && _retval == ZE_RESULT_SUCCESS) {
-    _on_created_event(*phEvent);
   }
 EOF
 
@@ -299,7 +275,10 @@ profiling_epilogue = lambda { |event_name|
   <<EOF
   if (_do_profile && #{event_name}) {
     if (_retval == ZE_RESULT_SUCCESS) {
-      _register_ze_event(#{event_name}, hCommandList, _ewrapper);
+      if (_ewrapper)
+        _register_our_event(_ewrapper, hCommandList);
+      else
+        _register_user_event(#{event_name}, hCommandList);
       tracepoint(lttng_ust_ze_profiling, event_profiling, #{event_name});
     } else if (_ewrapper)
       PUT_ZE_EVENT(_ewrapper);
@@ -328,10 +307,11 @@ EOF
    zeCommandListAppendImageCopyRegion
    zeCommandListAppendImageCopyToMemory
    zeCommandListAppendImageCopyFromMemory
-   zeCommandListAppendQueryKernelTimestamps
    zeCommandListAppendWriteGlobalTimestamp
    zeCommandListAppendImageCopyToMemoryExt
    zeCommandListAppendImageCopyFromMemoryExt].each do |c|
+  # zeCommandListAppendQueryKernelTimestamps intentionally NOT in this list
+  # — it has no kernel to time
   register_prologue c, profiling_prologue.call('hSignalEvent')
   register_prologue c, paranoid_drift_prologue
   register_epilogue c, profiling_epilogue.call('hSignalEvent')
